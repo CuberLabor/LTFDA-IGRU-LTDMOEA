@@ -36,8 +36,8 @@ classdef LTFDA3 < PROBLEM
         function Setting(obj)
             % [obj.taut,obj.nt,obj.starT,obj.maxT] = obj.ParameterSet(50,10,0,1000);
             % obj.maxFE = obj.N * obj.taut * (obj.maxT+1);                        % 要马上依据最大环境变化次数修正最大评估次数
-            % [obj.taut,obj.nt,obj.starIter,obj.maxIter] = obj.ParameterSet(10,10,0,4800);
-            [obj.taut,obj.nt,obj.starIter,obj.maxIter,obj.K,obj.alph] = obj.ParameterSet(10,10,0,4800,5,0.1);
+            [obj.taut,obj.nt,obj.starIter,obj.maxIter] = obj.ParameterSet(10,10,0,4800);
+            % [obj.taut,obj.nt,obj.starIter,obj.maxIter,obj.K,obj.alph] = obj.ParameterSet(10,10,0,4800,5,0.1);
             obj.maxFE = obj.N * obj.maxIter;
             obj.M = 2;
             if isempty(obj.D); obj.D = 10; end
