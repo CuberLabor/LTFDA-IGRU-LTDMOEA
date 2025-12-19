@@ -1,0 +1,275 @@
+classdef IGRU < ALGORITHM
+ % <multi> <real/integer/label/binary/permutation> <constrained/none> <dynamic>
+ % Dynamic NSGA-II
+ % type ---   1 --- 1. Mutation based reinitialization 2. Random reinitialization
+ % zeta --- 0.2 --- Ratio of reinitialized solutions
+ % K ---   7 --- 聚类数
+ % alph --- 0.09 --- 每个聚类预测的新个体数为alph*N
+ 
+%------------------------------- Reference --------------------------------
+% K. Deb, U. Bhaskara Rao N., and S. Karthik, Dynamic multi-objective
+% optimization and decision-making using modified NSGA-II: A case study on
+% hydro-thermal power scheduling, Proceedings of the International
+% Conference on Evolutionary Multi-Criterion Optimization, 2007, 803-817.
+%------------------------------- Copyright --------------------------------
+% Copyright (c) 2024 BIMK Group. You are free to use the PlatEMO for
+% research purposes. All publications which use this platform or any code
+% in the platform should acknowledge the use of "PlatEMO" and reference "Ye
+% Tian, Ran Cheng, Xingyi Zhang, and Yaochu Jin, PlatEMO: A MATLAB platform
+% for evolutionary multi-objective optimization [educational forum], IEEE
+% Computational Intelligence Magazine, 2017, 12(4): 73-87".
+%--------------------------------------------------------------------------
+% 优化了神经网络结构等一些超参
+
+    methods
+        function main(Algorithm,Problem)
+            is_save = 1;
+            is_save_result = 0;
+            is_save_respon = 0;
+            respon_Pop = [];
+            Problem.FE = Problem.N*Problem.starIter;                        % 调整初始评估次数 !这一步内置到测试函数里面行不通
+            warning('off', 'stats:pca:ColRankDefX'); % 关闭PCA相关的警告
+            %% Parameter setting
+            % Reset the number of saved populations (only for dynamic optimization) 
+            Algorithm.save = sign(Algorithm.save)*inf;                      % 理论需要随时间一直保存结果
+            iter = 0;                                                       % 单次环境变化种群迭代次数
+            changedNum = 0;                                                 % 环境变化总次数
+            K = 7;                                                          % 聚类的数量
+            alph = 0.09;
+            % K = Problem.K;
+            % alph = Problem.alph;
+            NL_in_K = round(alph * Problem.N);      % 新种群中每个聚类分配的数量
+            NS = round(0.2 *Problem. N);            % 短期策略的个体数
+            NM = Problem.N - NL_in_K*K - NS;        % 随机生成的个体数
+            sliding_memory_window = [];                                     % 滑动记忆窗口
+            % window_long = 2048;                                           % 滑动记忆窗口数量
+            window_long = 800;                                              % 滑动记忆窗口数量
+            incrementalNum = 0;                                             % 增量训练集的当前数据量
+            incrementalNumMax = 32;                                         % 增量训练集的最大数据量
+            stds = zeros(K, Problem.D);                                     % 全部主成分的方差
+            PCs = cell(K,1);                                                % 所有主成分向量（D×n_k）
+            CentersPred = zeros(K, Problem.D);                              % 预测的中心点
+            Last_C = [];                                                    % 上个时刻的种群质心
+            
+            %% 神经网络结构设置
+            net = [];
+            InputSize = K*Problem.M*Problem.D;
+            H = 64;
+            layers = [
+                sequenceInputLayer(InputSize, "Name","input")
+                gruLayer(H, "OutputMode","sequence", "Name","GRU", ...
+                "InputWeightsInitializer","he", ...
+                "RecurrentWeightsInitializer","orthogonal")
+                dropoutLayer(0.1, "Name","drop")
+                fullyConnectedLayer(InputSize, "Name","proj")
+                regressionLayer("Name","regressionoutput")
+                ];
+
+            optionsInit = trainingOptions('adam', ...                      % 优化器选择
+                'MaxEpochs', 80, ...                                       % 最大训练轮数
+                'Shuffle', 'never', ...                                    % 训练数据不会被打乱
+                'GradientThreshold', 1, ...                                % 梯度裁剪阈值
+                'InitialLearnRate', 0.003, ...                              % 初始学习率
+                'LearnRateSchedule', 'piecewise', ...                      % 学习率调整方式
+                'LearnRateDropPeriod', 20, ...                             % 学习率下降周期
+                'LearnRateDropFactor', 0.5, ...                            % 学习率下降因子
+                'L2Regularization', 0.0015, ...                             % L2正则化系数
+                'ExecutionEnvironment', 'gpu', ...
+                'Shuffle',          "never", ...
+                'Verbose', 0, ...
+                'Plots', 'none', ...
+                'MiniBatchSize', 1);                                       % 批次大小
+
+            optionsInitIncrement = trainingOptions('adam', ...             % 优化器选择
+                'MaxEpochs', 60, ...                                       % 最大训练轮数
+                'Shuffle', 'never', ...                                    % 训练数据不会被打乱
+                'GradientThreshold', 1, ...                                % 梯度裁剪阈值
+                'InitialLearnRate', 0.001, ...                             % 初始学习率
+                'LearnRateSchedule', 'piecewise', ...                      % 学习率调整方式
+                'LearnRateDropPeriod', 20, ...                             % 学习率下降周期
+                'LearnRateDropFactor', 0.5, ...                            % 学习率下降因子
+                'L2Regularization', 0.001, ...                             % L2正则化系数
+                'ExecutionEnvironment', 'gpu', ...
+                'Verbose', 0, ...
+                'Plots', 'none', ...
+                'MiniBatchSize', 1);                                       % 批次大小
+
+            % === 开始计时 ===
+            start_time = tic;
+            
+            %% 已经迭代了Problem.starIter次并初始化种群
+            % 从0开始则随机生成
+            Population = Problem.Initialization();
+            itax = 20;                                                      % 所有算法第一次环境变化前先迭代itax+taut次
+
+            Problem.FE = Problem.N*Problem.starIter;                        % 生成初始种群后重置FE
+
+            % Archive for storing all populations before each change        存档以存储每次环境变换前的种群
+            [~,FrontNo,CrowdDis] = EnvironmentalSelection(Population,Problem.N);
+            % [W,~] = UniformPoint(Problem.N,Problem.M);                      % 目标空间中的参考权重
+            % % Detect the neighbours of each solution
+            % B = pdist2(W,W);
+            % [~,B] = sort(B,2);
+            % T = max(ceil(Problem.N*0.15), 3);                                % 邻居数
+            % B = B(:,1:T);
+            % Z = min(Population.objs,[],1);
+            AllPop = [];                                                    
+            
+            %% Optimization
+            while Algorithm.NotTerminated(Population)
+                if itax>=0
+                    Problem.FE = Problem.N*Problem.starIter;                % 重置FE以达到第一次环境变化前额外迭代的效果  
+                    iter = 0;
+                end
+                if Changed(Problem,Population) || iter == Problem.taut(1)   % 不注重环境检测策略
+                    changedNum = changedNum + 1;
+                    % Save the population before the change                 存储环境变换前的种群
+                    if changedNum > 1 || Problem.starIter == 0              % 从0开始必保存，否则由于第一次是加载历史解，则从第二次开始保存
+                        AllPop = [AllPop,Population];
+                    end
+                    % React to the change                                   响应环境
+                    Curr_C = mean(Population.decs,1);
+                    if changedNum>1 || Problem.starIter == 0
+                        [feat, stds, PCs, sliding_memory_window] = construct_time_series(Population.decs, Problem, K, sliding_memory_window);
+                    end
+                    incrementalNum = incrementalNum + 1;
+                    if incrementalNum == incrementalNumMax
+                        if isempty(net)
+                            net = trainNetwork({sliding_memory_window(:,1:end-1)}, {sliding_memory_window(:,2:end)}, layers, optionsInit);
+                        else
+                            start_idx = max(1, size(sliding_memory_window,2) - window_long + 1);
+                            sliding_memory_window = sliding_memory_window(:,start_idx:end);         % 按照FIFO更新滑动窗口
+                            net = trainNetwork({sliding_memory_window(:,1:end-1)}, {sliding_memory_window(:,2:end)}, net.Layers, optionsInitIncrement);
+                        end
+                        resetState(net);                                            % 重置神经网络隐藏层状态
+                        net = predictAndUpdateState(net,sliding_memory_window(:,1:end-1));% 输入所有训练数据更新网络状态
+                        incrementalNum = 0;
+                    end
+                    if changedNum==1 && Problem.starIter == 0
+                        % TODO
+                        [Population,FrontNo,CrowdDis] = Reinitialization(Problem,Population,2,0.5);% 种群中的zeta比例个个体迭代成新种群，其余个体保留进入下一个环境 
+                    else
+                        %% 生成新种群
+                        if isempty(net)
+                            STPopNum = NL_in_K * K + NS;                    % 没有已训练好的神经网络模型，就把长期策略的评估次数留给短期策略
+                            newPopL = [];
+                        else
+                            STPopNum = NS;
+                            LTPop = zeros(NL_in_K * K, Problem.D);
+                            [net, featPred] = predictAndUpdateState(net, feat);
+                            featPred = double(featPred);
+                            offset = 0;
+                            for k = 1:K
+                                % 还原预测特征
+                                seg = featPred(offset + (1:(Problem.M*Problem.D)));          % 每K一段
+                                % 提取预测质心并反归一化
+                                CentersPredN = seg(1:Problem.D)';                % D×1
+                                lowerRow = reshape(Problem.lower,1,[]);
+                                upperRow = reshape(Problem.upper,1,[]);
+                                span     = upperRow - lowerRow;
+                                CentersPred(k,:) = (CentersPredN + 1)./2 .* span + lowerRow;
+                                CentersPred(k,:) = min(max(CentersPred(k,:), lowerRow), upperRow);  % 稳妥剪裁
+
+                                PCsPred = reshape(seg(Problem.D+1:end), Problem.D, Problem.M-1);     % D×(M-1)
+                                PCsPred = bsxfun(@rdivide, PCsPred, sqrt(sum(PCsPred.^2,1))+eps);        % 归一化    
+                                if size(PCsPred,2) > 1                                               % 不一定正交，得到最优正交基
+                                    [U,~,V] = svd(PCsPred, 'econ'); 
+                                    PCsPred = U * V'; 
+                                end
+                                offset = offset + Problem.M*Problem.D;
+                                PCsPred = [PCsPred, orth(null(PCsPred'))];
+                                
+                                % 主成分空间高斯采样
+                                latent = stds(k,1:Problem.D);                              % D维方差
+                                score_samples = randn(NL_in_K, Problem.D) .* sqrt(latent); % NL_in_K × D
+                            
+                                % 预测中心到原空间，越界处理
+                                pop_k = repmat(CentersPred(k,:), NL_in_K, 1) + score_samples * PCsPred';
+                                % pop_k = min(max(pop_k, Problem.lower), Problem.upper);
+                                pop_k = pop_k .* (pop_k >= Problem.lower & pop_k <= Problem.upper) + ...
+                                    (2*Problem.lower - pop_k) .* (pop_k < Problem.lower) + ...
+                                    (2*Problem.upper - pop_k) .* (pop_k > Problem.upper);
+
+                                % 写入最终种群
+                                LTPop((k-1)*NL_in_K+1:k*NL_in_K, :) = pop_k;
+                            end
+                            newPopL = Problem.Evaluation(LTPop);
+                            % Pred_C = mean(CentersPred,1);   
+                        end
+                        idxS = ~Truncation(Population.objs,Problem.N-STPopNum);
+                        newPopS=Response_Short(Population(idxS),STPopNum,Curr_C,Last_C,Problem);
+                        newPopM = Problem.Initialization(NM);
+                        Population = [newPopL, newPopS, newPopM];
+                        if(length(Population) ~=Problem.N) disp('评估次数不对'); end
+                        Problem.FE = Problem.FE - Problem.N;                     % 响应策略不消耗评估次数
+                    end
+                    [~,FrontNo,CrowdDis] = EnvironmentalSelection(Population,Problem.N);
+                    Last_C = Curr_C;
+                    iter = 0;
+
+                    if is_save_respon == 1
+                        respon_Pop = [respon_Pop,Population];
+                    end
+                end
+                
+                % for i = 1 : Problem.N
+                %     P = B(i,randperm(end));
+                %     Offspring = OperatorGAhalf(Problem,[Population(P(1)) Population(P(2))]);
+                % 
+                %     % Update the ideal point
+                %     Z = min(Z,Offspring.obj);
+                %     % Update the solutions in P by Tchebycheff approach
+                %     g_old = max(abs(Population(P).objs-repmat(Z,length(P),1)).*W(P,:),[],2);
+                %     g_new = max(repmat(abs(Offspring.obj-Z),length(P),1).*W(P,:),[],2);
+                %     update_index=P(g_old>g_new);
+                %     Population(update_index) = Offspring;
+                % end
+                MatingPool = TournamentSelection(2,Problem.N,FrontNo,-CrowdDis);
+                Offspring  = OperatorGA(Problem,Population(MatingPool));
+                [Population,FrontNo,CrowdDis] = EnvironmentalSelection([Population,Offspring],Problem.N);
+                
+                itax = itax-1;
+                iter = iter + 1;
+
+                if Problem.FE >= Problem.maxFE
+                    % === 结束计时并记录 ===
+                    run_time = toc(start_time);  % 单位为秒
+
+                    if is_save == 1
+                        if Problem.starIter == 0
+                            save_pareto(Problem,Population(all(Population.cons<=0,2)),'D:\Code\PlatEMO-master\PlatEMO\results\EDP_ColdStart', strcat(Problem.name), 'IGRU3'); 
+                        else
+                            save_pareto(Problem,Population(all(Population.cons<=0,2)),'D:\Code\PlatEMO-master\PlatEMO\results\EDP_HotStart', strcat(Problem.name), 'IGRU3');
+                        end
+                        % save_pareto(Problem,Population,'D:\Code\PlatEMO-master\PlatEMO\Problems\Multi-objective optimization\DataSet', strcat(Problem.name), 'IGRU3'); 
+                    end
+                    % Return all populations
+                    Population = [AllPop,Population];
+                    [~,rank]   = sort(Population.adds(zeros(length(Population),1)));
+                    Population = Population(rank);
+                    if is_save_result == 1
+                        IGDs = Problem.CalMetric2('IGD', Population); % 1×T
+                        % MIGD = mean(IGDs);
+                        % HVs = Problem.CalMetric2('HV', Population);   % 1×T
+                        % HVs = [];
+                        % if Problem.starIter == 0
+                        %     save_results(Problem,IGDs,HVs,run_time,'D:\Code\PlatEMO-master\PlatEMO\results\Comparative_ColdStart', strcat(Problem.name), 'IGRU3');
+                        % else
+                        %     save_results(Problem,IGDs,HVs,run_time,'D:\Code\PlatEMO-master\PlatEMO\results\Comparative_HotStart', strcat(Problem.name), 'IGRU3');
+                        % end
+                        save_ablation(Problem,IGDs,run_time,K,alph,'D:\Code\PlatEMO-master\PlatEMO\results\sensitivity', strcat(Problem.name), 'IGRU3'); 
+
+                        % save_results(Problem,IGDs,HVs,run_time,'D:\Code\PlatEMO-master\PlatEMO\results\ablation', strcat(Problem.name), 'IGRU3'); 
+                    end
+                    if is_save_respon == 1
+                        [~,rank]   = sort(respon_Pop.adds(zeros(length(respon_Pop),1)));
+                        respon_Pop = respon_Pop(rank);
+                        IGDs = Problem.CalMetric2('IGD', respon_Pop);
+                        HVs=[];
+                        save_results(Problem,IGDs,HVs,run_time,'D:\Code\PlatEMO-master\PlatEMO\results\Response_Pop', strcat(Problem.name), 'IGRU3');
+                    end
+                end
+            end
+        end
+    end
+end                   
